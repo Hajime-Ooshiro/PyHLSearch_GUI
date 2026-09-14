@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import json
 import numpy as np
+from numba import njit
 from dataclasses import dataclass, field
 import time
 from pathlib import Path
@@ -154,6 +155,23 @@ def shift_array(arr: NDArray[np.bool_], k: int) -> NDArray[np.bool_]:
     result[k:] = arr[: n - k]
     return result
  
+
+@njit
+def intersect_masks_and_count(
+    base_mask: NDArray[np.uint64],
+    row_complement: NDArray[np.uint64],
+) -> tuple[NDArray[np.uint64], int]:
+    """二つのパック済みマスクをANDし、残る候補数を数える。"""
+    node_mask = np.empty(base_mask.size, dtype=np.uint64)
+    count = 0
+    for index in range(base_mask.size):
+        value = base_mask[index] & row_complement[index]
+        node_mask[index] = value
+        while value:
+            value &= value - np.uint64(1)
+            count += 1
+    return node_mask, count
+
 
 def build_base_rows(primes: Sequence[int], cols: int = cfg.cols) -> NDArray[np.bool_]:
     """指定した素数リストから各階層の基底行を生成する。
@@ -338,10 +356,6 @@ class State:
 
     def count_zero(self, arr: NDArray[np.bool_]) -> int:
         return int(np.sum(np.all(arr == 0, axis=0)))
-
-    def _count_nonzero(self, mask: NDArray[np.uint64]) -> int:
-        return int(np.bitwise_count(mask).sum())
-
 
     def _update_shifts(self) -> None:
         """target 到達パスと最大値パスを順序を保って重複なく公開する。"""
@@ -578,8 +592,7 @@ class State:
             # try/finally で保証する。
             try:
                 row_complement = self.shift_table[level][i]  # ~row_nonzero(NOT演算済み、事前作成済み)
-                node_mask = base_mask & row_complement
-                count = self._count_nonzero(node_mask)
+                node_mask, count = intersect_masks_and_count(base_mask, row_complement)
 
                 if count < self.max_count:
                     key.pop()
