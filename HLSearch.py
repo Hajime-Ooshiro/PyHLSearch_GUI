@@ -280,11 +280,29 @@ class State:
         #     raise ValueError(
         #         f"params の階層数({len(params)})が depth({config.depth})未満です"
         #     )
-        params[0] = [1]
-        params[1] = [1]
-        params[2] = [4]
-        params[3] = [3,4,5]
-        params[4] = [5,7]
+        # params[0] = [1]
+        # params[1] = [1]
+        # params[2] = [4]
+        # params[3] = [4]
+        # params[4] = [5,7]
+        # params[5] = [1, 11]
+        # params[6] = [15]
+        # params[7] = [7, 16]
+        # params[8] = [9, 13, 17, 21]
+        # params[9] = [0, 26]
+        # params[10] = [0, 13, 14, 27]
+        # params[11] = [2, 4, 9]
+        # params[12] = [2, 13, 29]
+        # params[13] = [2, 5, 9]  # [1,2,5,9,16,18,26]
+        # params[14] = [29]
+        # params[15] = [41, 48]
+        # params[16] = [8, 32, 33, 45]
+        # params[17] = [4, 31]
+        # params[18] = [9, 32, 44]
+        # params[19] = [16]
+        # params[20] = [44]
+        for row in range(ROWS):
+            params[row] = [i for i in range(row+1,primes[row])]
 
         self.max_depth = config.max_depth if max_depth is None else max_depth
         self.target = config.target if target is None else target
@@ -695,9 +713,15 @@ class MainWindow(QMainWindow):
         input_row.addStretch(1)
         layout.addLayout(input_row)
 
+        button_row = QHBoxLayout()
         self.run_button = QPushButton("探索開始")
         self.run_button.clicked.connect(self.on_run_clicked)
-        layout.addWidget(self.run_button)
+        button_row.addWidget(self.run_button)
+
+        self.clear_button = QPushButton("クリア")
+        self.clear_button.clicked.connect(self.on_clear_clicked)
+        button_row.addWidget(self.clear_button)
+        layout.addLayout(button_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)  # 総ノード数が事前に分からないため不定モードで表示
@@ -721,6 +745,7 @@ class MainWindow(QMainWindow):
         depth = self.depth_spin.value()
 
         self.run_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.result_edit.clear()
         self.result_edit.appendPlainText(f"深さ {depth} で探索を開始します…")
@@ -744,6 +769,7 @@ class MainWindow(QMainWindow):
         """探索が正常終了したときの表示。"""
         self.progress_bar.setVisible(False)
         self.run_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
         self.statusBar().showMessage("探索完了")
 
         lines = [
@@ -768,8 +794,13 @@ class MainWindow(QMainWindow):
         """探索中に例外が発生したときの表示。"""
         self.progress_bar.setVisible(False)
         self.run_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
         self.statusBar().showMessage("探索中にエラーが発生しました")
         self.result_edit.setPlainText(f"エラーが発生しました:\n\n{message}")
+
+    def on_clear_clicked(self) -> None:
+        """「クリア」ボタン押下時: テキストエリアの内容を消去する。"""
+        self.result_edit.clear()
 
 
 
