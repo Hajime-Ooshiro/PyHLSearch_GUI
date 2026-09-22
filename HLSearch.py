@@ -517,7 +517,7 @@ class State:
         if self.db_path is None or self.db_conn is None:
             return
         self.db_conn.execute(
-            "DELETE FROM search_results where depth = ?", str(depth)
+            "DELETE FROM search_results WHERE depth = ?", (depth,)
         )
         self.db_conn.commit()
 
