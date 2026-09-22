@@ -1,20 +1,17 @@
 #HLSearch.py
-import csv
 import sys
 import os
 import logging
 import logging.handlers
 import json
+import sqlite3
 import numpy as np
 from numba import njit
 from dataclasses import dataclass, field
 import time
 from pathlib import Path
-import itertools
 from typing import Sequence
-import multiprocessing
 from tqdm import tqdm
-import ctypes
 from numpy.typing import NDArray
 
 
@@ -59,7 +56,6 @@ PRIMES = [
 ]
 ROWS = len(PRIMES)  # 249 rows
 COLS = 3159
-TARGET = 447
 WORD_BITS = 64  # uint64 1語あたりのビット数(shift_table のパック単位)
 PARAMS = [
     [i for i in range(prime)] for prime in list(PRIMES)        
@@ -73,7 +69,6 @@ class SearchConfig:
         primes: 探索対象の素数リスト。デフォルトでは 1579 以下の素数を生成する。
         depth: 深さとして使う素数の数。
         max_depth: 深さの上限。
-        target: `depth == max_depth` のときの打ち切り目標値.
         cols: 列数。
         progress_mininterval: tqdm の最短更新間隔。
         postfix_update_interval: postfix 更新の頻度。
@@ -83,11 +78,12 @@ class SearchConfig:
     params: list[list[int]] = PARAMS
     depth: int = 8
     max_depth: int = 249
-    target: int = 447
     cols: int = COLS
     progress_mininterval: float = 1.0
     postfix_update_interval: int = 10000
     shift_path_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shift_path.txt")
+    # 探索結果(depth, count, key)を書き込むsqliteファイル
+    results_db_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "search_results.db")
 
     def __post_init__(self) -> None:
         """設定値の整合性を早期に検証する(実行時ではなく構築時に失敗させる)。"""
@@ -113,10 +109,13 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(base_dir: str | os.PathLike[str], console_level: str="INFO") -> str:
     """コンソールとファイルの両方にログを出力するよう設定する。"""
-    log_path = os.path.join(base_dir, "HLSearch.log")
+    log_path = Path(base_dir) / "HLSearch.log"
 
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()  # 二重登録防止(再実行・再インポート対策)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
 
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(message)s",
@@ -132,13 +131,14 @@ def setup_logging(base_dir: str | os.PathLike[str], console_level: str="INFO") -
         log_path,
         maxBytes=10*1024*1024,
         backupCount=3,
-        encoding="utf-8")
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    logger.info(f"ログファイルを作成しました: {log_path}")
-    return log_path
+    logger.info("ログ出力を開始しました: %s", log_path)
+    return str(log_path)
 
 
 def shift_array(arr: NDArray[np.bool_], k: int) -> NDArray[np.bool_]:
@@ -172,6 +172,10 @@ def intersect_masks_and_count(
             count += 1
     return node_mask, count
 
+def calculate_upper_bound(
+        level:int, 
+        depth:int)->int:
+    return depth - level
 
 def build_base_rows(primes: Sequence[int], cols: int = cfg.cols) -> NDArray[np.bool_]:
     """指定した素数リストから各階層の基底行を生成する。
@@ -259,32 +263,43 @@ class State:
         "shift_table",
         "zero_mask",
         "max_depth",
-        "target",
         "max_count",
         "shifts",
-        "target_shifts",
         "max_shifts",
-        "target_results",
         "results",
         "start_time",
+        "end_time",
         "node_count",
         "pbar",
         "checkpoint_path",
         "checkpoint_interval",
         "_stack",
         "progress_callback",
+        "db_path",
+        "db_conn",
+        "db_buffer",
+        "db_batch_size",
     )
 
-    def __init__(self, config: SearchConfig | Sequence[int], shift_table: list[NDArray[np.uint64]], max_depth: int | None = None, target: int | None = None, checkpoint_path: str | os.PathLike[str] | None = None, checkpoint_interval: int = 1000, progress_callback=None) -> None:
+    def __init__(
+        self,
+        config: SearchConfig | Sequence[int],
+        shift_table: list[NDArray[np.uint64]],
+        max_depth: int | None = None,
+        checkpoint_path: str | os.PathLike[str] | None = None,
+        checkpoint_interval: int = 1000,
+        progress_callback=None,
+        db_path: str | os.PathLike[str] | None = None,
+        db_batch_size: int = 1000,
+    ) -> None:
         # SearchConfig 以外(生の primes 列)が渡された場合は、まず SearchConfig に
         # 正規化してしまう。これにより以降の属性代入を両ケースで共通化でき、
-        # max_depth/target の決定ロジックを二重に書かずに済む。
+        # max_depth の決定ロジックを二重に書かずに済む。
         if not isinstance(config, SearchConfig):
             config = SearchConfig(
                 primes=config,
                 depth=len(config),
                 max_depth=cfg.max_depth if max_depth is None else max_depth,
-                target=cfg.target if target is None else target,
                 cols=cfg.cols,
             )
         self.config = config
@@ -319,11 +334,10 @@ class State:
         # params[18] = [9, 32, 44]
         # params[19] = [16]
         # params[20] = [44]
-        for row in range(ROWS):
-            params[row] = [i for i in range(row+1,primes[row])]
+        # for row in range(ROWS):
+        #     params[row] = [i for i in range(int(primes[row]/2),primes[row])]
 
         self.max_depth = config.max_depth if max_depth is None else max_depth
-        self.target = config.target if target is None else target
 
         self.key: list[int] = []
         self.primes: Sequence[int] = primes
@@ -331,20 +345,31 @@ class State:
         self.shift_table: list[NDArray[np.uint64]] = shift_table
         self.max_count: int = 0
         self.shifts: list[list[int]] = []
-        self.target_shifts: list[list[int]] = []
         self.max_shifts: list[list[int]] = []
-        self.target_results: int = 0
         self.results: int = 0
         self.start_time: float = time.time()
+        self.end_time: float = 0
         self.node_count: int = 0
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self.checkpoint_interval = checkpoint_interval
         self._stack: list[list] = []
+        # 探索結果(depth, count, key)を書き込むsqlite。
+        # db_path=False で明示的に無効化しない限り、config.results_db_file を既定値として使う。
+        if db_path is False:
+            self.db_path = None
+        elif db_path is None:
+            self.db_path = Path(config.results_db_file)
+        else:
+            self.db_path = Path(db_path)
+        self.db_conn: sqlite3.Connection | None = None
+        self.db_buffer: list[tuple[int, int, str]] = []
+        self.db_batch_size = db_batch_size
+        self._init_db()
         # まだどの階層のシフトも決めていない状態の zero_mask(全列が候補)。
         # チェックポイントから読み込む場合は _load_checkpoint 側で上書きされる。
         self.zero_mask: NDArray[np.uint64] = build_initial_zero_mask(config.cols)
         # GUIなどから進捗を受け取りたい場合に渡すコールバック。
-        # dict(node_count, max_count, target_results, depth, key) を引数に呼ばれる。
+        # dict(node_count, max_count, depth, key) を引数に呼ばれる。
         self.progress_callback = progress_callback
         self.pbar = tqdm(
             desc="search",
@@ -358,9 +383,9 @@ class State:
         return int(np.sum(np.all(arr == 0, axis=0)))
 
     def _update_shifts(self) -> None:
-        """target 到達パスと最大値パスを順序を保って重複なく公開する。"""
+        """到達パスと最大値パスを順序を保って重複なく公開する。"""
         self.shifts = []
-        for path in self.target_shifts + self.max_shifts:
+        for path in self.max_shifts:
             if path not in self.shifts:
                 self.shifts.append(path)
 
@@ -387,18 +412,15 @@ class State:
                 "depth": self.config.depth,
                 "cols": self.config.cols,
                 "max_depth": self.max_depth,
-                "target": self.target,
                 "traversal_order": "descending",
                 "mask_format": "uint64-little-endian",
-                "result_format": "target-and-maximum-path-counts",
+                "result_format": "maximum-path-counts",
             },
             "key": list(self.key),
             "zero_mask": self._mask_to_int(self.zero_mask),
             "max_count": self.max_count,
             "results": self.results,
-            "target_results": self.target_results,
             "shifts": self.shifts,
-            "target_shifts": self.target_shifts,
             "max_shifts": self.max_shifts,
             "node_count": self.node_count,
             "stack": stack_payload,
@@ -438,10 +460,9 @@ class State:
             "depth": self.config.depth,
             "cols": self.config.cols,
             "max_depth": self.max_depth,
-            "target": self.target,
             "traversal_order": "descending",
             "mask_format": "uint64-little-endian",
-            "result_format": "target-and-maximum-path-counts",
+            "result_format": "maximum-path-counts",
         }
         if saved.get("settings") != expected_settings:
             raise ValueError(
@@ -453,8 +474,6 @@ class State:
         self.zero_mask = self._int_to_mask(int(saved.get("zero_mask", 0)), self.config.cols)
         self.max_count = int(saved.get("max_count", 0))
         self.results = int(saved.get("results", 0))
-        self.target_results = int(saved.get("target_results", 0))
-        self.target_shifts = list(saved.get("target_shifts", []))
         self.max_shifts = list(saved.get("max_shifts", []))
         self._update_shifts()
         self.node_count = int(saved.get("node_count", 0))
@@ -469,6 +488,57 @@ class State:
             for entry in raw_stack
         ]
 
+    def _init_db(self) -> None:
+        """探索結果(depth, count, key)を保存するsqliteテーブルを用意する。"""
+        if self.db_path is None:
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_conn = sqlite3.connect(str(self.db_path))
+        self.db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                depth INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # depth・countでの絞り込み/集計をしやすくする補助インデックス。
+        self.db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_search_results_depth_count "
+            "ON search_results (depth, count)"
+        )
+        self.db_conn.commit()
+
+    def _record_result(self, depth: int, count: int, key: Sequence[int]) -> None:
+        """1件の探索結果をバッファに積み、必要ならまとめてDBへflushする。"""
+        if self.db_path is None:
+            return
+        self.db_buffer.append((depth, count, json.dumps(list(key))))
+        if len(self.db_buffer) >= self.db_batch_size:
+            self._flush_db()
+
+    def _flush_db(self) -> None:
+        """バッファに溜まった探索結果を一括でsqliteに書き込む。"""
+        if self.db_path is None or self.db_conn is None or not self.db_buffer:
+            return
+        self.db_conn.executemany(
+            "INSERT INTO search_results (depth, count, key) VALUES (?, ?, ?)",
+            self.db_buffer,
+        )
+        self.db_conn.commit()
+        self.db_buffer.clear()
+
+    def _close_db(self) -> None:
+        """残りのバッファをflushしてDB接続を閉じる。"""
+        if self.db_conn is None:
+            return
+        self._flush_db()
+        self.db_conn.close()
+        self.db_conn = None
+
     def report_progress(self, force: bool = False) -> None:
         """
         tqdmの進捗バーを更新する(ログファイルには出さない)。
@@ -482,8 +552,8 @@ class State:
             self.pbar.update(self.config.postfix_update_interval)
             self.pbar.set_postfix(
                 best=self.max_count,
-                hits=self.target_results,
                 depth=len(self.key),
+                hits=self.results,
                 key=list(self.key),
                 refresh=force,
             )
@@ -497,7 +567,7 @@ class State:
                 {
                     "node_count": self.node_count,
                     "max_count": self.max_count,
-                    "target_results": self.target_results,
+                    "results": self.results,
                     "depth": len(self.key),
                     "key": list(self.key),
                 }
@@ -593,21 +663,24 @@ class State:
             try:
                 row_complement = self.shift_table[level][i]  # ~row_nonzero(NOT演算済み、事前作成済み)
                 node_mask, count = intersect_masks_and_count(base_mask, row_complement)
+                if level + 1 < depth:
+                    # max_potential_gain = calculate_upper_bound(node_mask, base_mask, self.zero_mask, level + 1, depth)
+                    max_potential_gain = calculate_upper_bound(level + 1, depth)
+                    # 現在のカウントに、残り全ての可能性を足し合わせる
+                    if count + max_potential_gain < self.max_count:
+                        print(f"Upper Bound Pruning triggered. level:{level} depth:{depth}") # 確認用ログ
+                        key.pop()
+                        continue 
 
                 if count < self.max_count:
-                    key.pop()
                     continue
 
                 if level + 1 >= depth:
-                    if count == self.target:
-                        message = f"target depth={depth} key={list(key)} count={count}"
-                        self.pbar.write(message)
-                        logger.info(message)  # ログファイルにも残す(pbar.writeだけだと画面にしか出ない)
-                        self.target_results += 1
-                        self.target_shifts.append(list(key))
-
-                    if not (depth == self.max_depth and count > self.target):
+                    # 葉ノード(depthまで達したノード)の探索結果を都度sqliteに記録する。
+                    self._record_result(depth, count, key)
+                    if not (depth == self.max_depth):
                         if count > self.max_count:
+                            logger.debug(f"level:{level} key:{list(key)} count:{count}")
                             self.max_count = count
                             self.results = 1
                             self.max_shifts = [list(key)]
@@ -641,6 +714,7 @@ class State:
             self.pbar.close()
             if self.checkpoint_path is not None:
                 self._save_checkpoint()
+            self._close_db()
 
         return self
 
@@ -665,6 +739,7 @@ class SearchWorker(QThread):
 
     def run(self) -> None:  # noqa: D401 (QThreadのオーバーライド)
         try:
+            logger.info("探索を開始します: depth=%d", self.depth)
             config = SearchConfig()
             config.depth = self.depth
             config.__post_init__()  # 入力値の検証(depthの範囲など)を行う
@@ -674,15 +749,21 @@ class SearchWorker(QThread):
                 config,
                 shift_table,
                 max_depth=config.max_depth,
-                target=config.target,
                 progress_callback=self.progress.emit,
             )
             state.run(depth=config.depth)
         except Exception:  # noqa: BLE001 (GUIへエラー内容を伝えるため広く捕捉)
             import traceback
 
+            logger.exception("探索中にエラーが発生しました")
             self.failed.emit(traceback.format_exc())
         else:
+            logger.info(
+                "探索が完了しました: nodes=%d max_count=%d results=%d",
+                state.node_count,
+                state.max_count,
+                state.results,
+            )
             self.finished_ok.emit(state)
 
 
@@ -692,7 +773,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("反例探索表")
-
+        logger.info("開始")
         menubar = QMenuBar()
         file_menu = menubar.addMenu("ファイル")
 
@@ -762,6 +843,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.result_edit.clear()
         self.result_edit.appendPlainText(f"深さ {depth} で探索を開始します…")
+        logger.info(f"深さ {depth} で探索を開始します…")
         self.statusBar().showMessage("探索中…")
 
         self._worker = SearchWorker(depth, parent=self)
@@ -774,7 +856,8 @@ class MainWindow(QMainWindow):
         """探索中の進捗表示を更新する。"""
         self.statusBar().showMessage(
             f"探索中… ノード数={info['node_count']:,} "
-            f"最良値={info['max_count']} target到達={info['target_results']} "
+            f"最良値={info['max_count']} "
+            f"件数={info['results']} "
             f"深さ={info['depth']}"
         )
 
@@ -784,22 +867,19 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.clear_button.setEnabled(True)
         self.statusBar().showMessage("探索完了")
-
+        logger.info("探索完了")
+        state.end_time = time.time()
+        work_time = state.end_time - state.start_time
         lines = [
             "探索が完了しました。",
+            f"探索時間: {work_time}sec",
             f"総ノード数: {state.node_count:,}",
             f"最良値(max_count): {state.max_count}",
-            f"target({state.target})到達回数: {state.target_results}",
-            "",
+            f"件数: {state.results}",
             "最良値を達成したシフト列:",
         ]
         for shift in state.max_shifts:
             lines.append(f"  {shift}")
-        if state.target_shifts:
-            lines.append("")
-            lines.append(f"target({state.target})を達成したシフト列:")
-            for shift in state.target_shifts:
-                lines.append(f"  {shift}")
 
         self.result_edit.setPlainText("\n".join(lines))
 
@@ -818,8 +898,12 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    setup_logging(Path(__file__).resolve().parent)
+    logger.info("アプリケーションを開始します")
     app = QApplication(sys.argv)
     window = MainWindow()
     window.resize(1200, 800)
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    logger.info("アプリケーションを終了します: exit_code=%d", exit_code)
+    sys.exit(exit_code)
