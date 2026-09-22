@@ -512,6 +512,15 @@ class State:
         )
         self.db_conn.commit()
 
+    def _delete_db(self, depth: int) -> None:
+        """指定したdepthのレコードを削除する。"""
+        if self.db_path is None or self.db_conn is None:
+            return
+        self.db_conn.execute(
+            "DELETE FROM search_results where depth = ?", str(depth)
+        )
+        self.db_conn.commit()
+
     def _record_result(self, depth: int, count: int, key: Sequence[int]) -> None:
         """1件の探索結果をバッファに積み、必要ならまとめてDBへflushする。"""
         if self.db_path is None:
@@ -531,6 +540,14 @@ class State:
         self.db_conn.commit()
         self.db_buffer.clear()
 
+    def _open_db(self) -> None:
+        """DB接続"""
+        if self.db_path is None:
+            return
+        if self.db_conn:
+            return
+        self.db_conn = sqlite3.connect(str(self.db_path))
+
     def _close_db(self) -> None:
         """残りのバッファをflushしてDB接続を閉じる。"""
         if self.db_conn is None:
@@ -538,6 +555,57 @@ class State:
         self._flush_db()
         self.db_conn.close()
         self.db_conn = None
+
+    def _fetch_prefix_keys(self, depth: int) -> list[list[int]]:
+        """dbから指定depthのレコードを全件検索し、それぞれのkeyを返す。
+
+        同じdepthに複数件のレコードがある場合(=同じmax_countを達成する
+        複数のkeyがある場合)、そのすべてを候補prefixとして返す。
+        countが大きいものを先に返す(通常はいずれも同じmax_countのはず)。
+        重複するkeyはまとめる。レコードが無い/dbが無効な場合は空リストを返す。
+        """
+        if self.db_path is None or depth < 0:
+            return []
+        self._open_db()
+        if self.db_conn is None:
+            return []
+        cur = self.db_conn.execute(
+            "SELECT DISTINCT key FROM search_results WHERE depth = ? "
+            "ORDER BY count DESC, id ASC",
+            (depth,),
+        )
+        rows = cur.fetchall()
+        return [list(json.loads(row[0])) for row in rows]
+
+    def _fetch_prefix_key(self, depth: int) -> list[int] | None:
+        """dbから指定depthのレコードを1件だけ検索し、そのkeyを返す(後方互換用)。
+
+        複数件ある場合は`_fetch_prefix_keys`の先頭(count最大)を返す。
+        レコードが無い/dbが無効な場合はNoneを返す。
+        """
+        keys = self._fetch_prefix_keys(depth)
+        return keys[0] if keys else None
+
+    def _mask_from_key(self, key: Sequence[int]) -> NDArray[np.uint64]:
+        """keyの各階層のシフト値を先頭から順にAND演算し、zero_maskを再計算する。"""
+        mask = build_initial_zero_mask(self.config.cols)
+        for level, i in enumerate(key):
+            row_complement = self.shift_table[level][i]
+            mask, _ = intersect_masks_and_count(mask, row_complement)
+        return mask
+
+    def _seed_from_key(self, key: Sequence[int]) -> None:
+        """dbから見つかったkeyを確定済みprefixとしてself.key/self.zero_mask/self._stackへ反映する。
+
+        これにより`search()`はprefixの続きの階層(= len(key)階層目)から
+        探索を開始し、既に決まっている階層の候補を再度総当りしない。
+        """
+        self.key = list(key)
+        prefix_mask = self._mask_from_key(key)
+        self.zero_mask = prefix_mask
+        next_level = len(key)
+        next_len = len(self.params[next_level])
+        self._stack = [[next_level, prefix_mask.copy(), next_len - 1, next_len]]
 
     def report_progress(self, force: bool = False) -> None:
         """
@@ -673,11 +741,12 @@ class State:
                         continue 
 
                 if count < self.max_count:
+                    key.pop()
                     continue
 
                 if level + 1 >= depth:
                     # 葉ノード(depthまで達したノード)の探索結果を都度sqliteに記録する。
-                    self._record_result(depth, count, key)
+                    # self._record_result(depth, count, key)
                     if not (depth == self.max_depth):
                         if count > self.max_count:
                             logger.debug(f"level:{level} key:{list(key)} count:{count}")
@@ -705,10 +774,40 @@ class State:
         depth_to_use = self.config.depth if depth is None else depth
         if depth_to_use > len(self.primes):
             raise ValueError(f"depth={depth_to_use} が使用可能な素数の個数({len(self.primes)})を超えています")
+        prefix_keys: list[list[int]] = []
         if resume_from is not None:
             self._load_checkpoint(resume_from)
+        elif depth_to_use > 0:
+            # チェックポイントから再開しない場合は、dbに depth-1 の探索結果が
+            # 無いか調べる。レコード(同じmax_countを達成した複数のkeyがあり
+            # 得る)があれば、それぞれをキー(確定済みprefix)として使い、
+            # search(depth_to_use)は最後の1階層だけをprefixごとに探索する。
+            # レコードが無ければ、dbを使わず先頭階層からそのまま探索する。
+            self._open_db()
+            prefix_keys = [
+                key for key in self._fetch_prefix_keys(depth_to_use - 1)
+                if len(key) == depth_to_use - 1
+            ]
+            if prefix_keys:
+                logger.info(
+                    "dbにdepth=%dのレコードが%d件見つかりました。それぞれをキーとして使用します: keys=%s",
+                    depth_to_use - 1, len(prefix_keys), prefix_keys,
+                )
+            else:
+                logger.info(
+                    "dbにdepth=%dのレコードが見つからないため、dbを使わず探索します",
+                    depth_to_use - 1,
+                )
         try:
-            self.search(depth_to_use)
+            if prefix_keys:
+                # 見つかった候補prefixそれぞれについて、最後の階層を探索する。
+                # max_count/results/max_shiftsはインスタンス内で共有されるため、
+                # あるprefixで見つかった良い結果が、後続prefixの枝刈りにも活きる。
+                for prefix_key in prefix_keys:
+                    self._seed_from_key(prefix_key)
+                    self.search(depth_to_use)
+            else:
+                self.search(depth_to_use)
             self.report_progress(force=True)
         finally:
             self.pbar.close()
@@ -764,6 +863,12 @@ class SearchWorker(QThread):
                 state.max_count,
                 state.results,
             )
+            state._open_db()
+            state._delete_db(depth=config.depth)
+            for shift in state.max_shifts:
+                state._record_result(depth=config.depth, count=state.max_count, key=shift)
+            state._close_db()
+
             self.finished_ok.emit(state)
 
 
@@ -787,12 +892,12 @@ class MainWindow(QMainWindow):
         self.setMenuBar(menubar)
 
         self.statusBar().showMessage("準備完了")
-        self.status_label = QLabel("行: 0 / 列: 0")
-        self.selection_label = QLabel("選択: なし")
-        self.zero_count_label = QLabel("ゼロ列数: 0")
-        self.statusBar().addPermanentWidget(self.status_label)
-        self.statusBar().addPermanentWidget(self.selection_label)
-        self.statusBar().addPermanentWidget(self.zero_count_label)
+        # self.status_label = QLabel("行: 0 / 列: 0")
+        # self.selection_label = QLabel("選択: なし")
+        # self.zero_count_label = QLabel("ゼロ列数: 0")
+        # self.statusBar().addPermanentWidget(self.status_label)
+        # self.statusBar().addPermanentWidget(self.selection_label)
+        # self.statusBar().addPermanentWidget(self.zero_count_label)
 
         # --- 中央ウィジェット: 数値入力欄・実行ボタン・進捗バー・結果表示欄 ---
         central = QWidget()

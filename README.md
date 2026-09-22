@@ -17,6 +17,7 @@
 - **枝刈り**: 現在の候補列数が既知の最大値を下回った時点で、それ以上探索しても意味がない枝を打ち切ります。
 - **チェックポイント保存/再開**: 探索状態(スタック、キー、マスク、これまでの結果など)をJSON形式で定期的に保存し、途中から再開できます(`version: 2` フォーマット)。
 - **探索結果のsqlite保存**: 探索中に深さ(`depth`)まで到達した各ノードの `depth` / `count` / `key` をsqliteデータベースへバッチ書き込みします。大量の結果もSQLで柔軟に検索・集計できます。
+- **db内容を使った探索の高速化(prefix再利用)**: `state.run(depth=...)` を呼ぶと、チェックポイントから再開する場合を除き、db内に `depth-1` の探索結果があるかどうかを自動的に検索します。レコードが見つかった場合は、そのシフト列(`key`)を確定済みのprefixとして使い、まだ決まっていない最後の1階層だけを探索します(depth-1までの全階層を再度総当りしません)。同じ `depth-1` に複数件のレコード(同じ `max_count` を達成する複数の `key`)がある場合は、そのすべてをprefix候補として順番に探索します。該当レコードが無い場合は、従来通りdbを使わず先頭階層から全探索します。
 - **進捗表示**: `tqdm` によるコンソール進捗バー表示と、ログファイルへの記録(`HLSearch.log`、ローテーション付き)に対応しています。
 - **GUI(PySide6)**: 「探索する深さ」を指定して探索を開始し、進捗・最良結果をウィンドウ上で確認できるデスクトップアプリを同梱しています。
 
@@ -82,6 +83,27 @@ for depth, count, key in rows:
     print(depth, count, key)
 ```
 
+### depthを1つずつ増やしながら探索する(dbの自動活用)
+
+`state.run(depth=...)` は、`resume_from` を指定しない限り、実行のたびにdb内の `depth-1` のレコードを自動検索し、見つかればそれをprefixとして使って最後の1階層だけを探索します。そのため、`depth` を1つずつ増やしながら繰り返し実行すると、2回目以降は毎回全階層を総当りする必要がなく、探索が高速化されます。
+
+```python
+from HLSearch import SearchConfig, build_shift_table, State
+
+config = SearchConfig()
+
+for depth in range(1, 9):
+    config.depth = depth
+    shift_table = build_shift_table(config.primes[:config.depth], config.cols)
+    state = State(config, shift_table, max_depth=config.max_depth)
+    state.run(depth=config.depth)  # depth-1のdbレコードがあれば自動的にキーとして使う
+    print(depth, state.max_count, state.results)
+```
+
+- `depth-1` のレコードがdbに無い場合(初回や、そのdepthをまだ探索していない場合)は、従来通りdbを使わず先頭階層から全探索します。
+- `depth-1` に複数の最良キーが記録されている場合は、そのすべてを候補prefixとして順に探索します。あるprefixで見つかった `max_count` は、`State` インスタンス内で共有されるため、後続prefixの枝刈りにもそのまま活かされます。
+- この自動検索は `resume_from` を指定した場合(チェックポイントからの再開)には行われません。チェックポイントの再開が優先されます。
+
 ### チェックポイントからの再開
 
 ```python
@@ -116,3 +138,4 @@ state.run(depth=config.depth, resume_from="checkpoint.json")
 - `depth` は `len(primes)`(249)を超えられません。
 - 探索は組み合わせ数が非常に大きくなるため、深さを増やすほど計算時間が急増します。長時間実行する場合はチェックポイント機能の利用を推奨します。
 - GUIを起動すると、スクリプトと同じディレクトリに`HLSearch.log`が作成されます。探索の開始・完了・エラーはこのファイルとコンソールへ、詳細情報はログファイルへ記録されます。
+- `state.run(depth=...)` はdb内の `depth-1` のレコードを自動的にprefixとして使うため、意図せず古い(別条件の)`search_results.db` を使い回すと、誤ったprefixから探索を始めてしまう可能性があります。`primes` や `cols` などの条件を変えて探索し直す場合は、`results_db_file` を別ファイルにするか、既存のdbを削除・退避してください。
