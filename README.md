@@ -46,6 +46,12 @@ Python ループではなく nopython モードで実行されます。
 python HLSearch.py
 ```
 
+初期表示する探索深さを指定する場合は `--depth` を使います。
+
+```bash
+python HLSearch.py --depth 8
+```
+
 ウィンドウが起動したら、「探索する深さ(使用する素数の個数)」を指定して「探索開始」ボタンを押します。探索はバックグラウンドスレッド(`SearchWorker`)で実行されるため、GUIがフリーズすることはありません。完了すると、以下が結果欄に表示されます。
 
 - 総ノード数
@@ -53,13 +59,22 @@ python HLSearch.py
 - 最良値を達成した件数(`results`)
 - 最良値を達成したシフト列の一覧
 
+### コンソールで進捗を表示して実行する
+
+`--show-progress` を指定すると GUI を起動せず、`tqdm` の進捗バーを
+コンソールへ表示して探索します。`--depth` で探索深さを指定できます
+（既定値は 8）。
+
+```bash
+python HLSearch.py --show-progress --depth 8
+```
+
 ### コードから直接実行する(例)
 
 ```python
 from HLSearch import SearchConfig, build_shift_table, State
 
-config = SearchConfig()
-config.depth = 8  # 使用する素数の個数
+config = SearchConfig(depth=8)  # 使用する素数の個数
 
 shift_table = build_shift_table(config.primes[:config.depth], config.cols)
 state = State(config, shift_table, max_depth=config.max_depth)
@@ -128,6 +143,7 @@ state.run(depth=config.depth, resume_from="checkpoint.json")
 ## ファイル構成
 
 - `HLSearch.py` — 探索ロジックとPySide6製GUIを含むメインスクリプト。
+- `SearchDB` — `HLSearch.py` 内でSQLiteの初期化、結果のバッファ保存、prefix取得を担当するクラス。
 - `HLSearch.log` — 実行時に自動生成されるログファイル(ローテーション、最大10MB×3世代)。
 - `shift_path.txt` — 結果出力先(設定で変更可能)。
 - `search_results.db` — 探索結果(`depth`, `count`, `key`)を記録するsqliteファイル(`results_db_file`で変更可能、`db_path=False`で無効化可能)。テーブル名は `search_results`。
